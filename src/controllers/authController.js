@@ -52,7 +52,7 @@ exports.register = async (req, res) => {
     if (existingUser) {
       return res.status(409).json({
         success: false,
-        message: 'Email already registered',
+        message: 'You already have an account with this email. Please sign in instead.',
       });
     }
 
@@ -88,7 +88,7 @@ exports.register = async (req, res) => {
     if (error?.code === 11000 && error?.keyPattern?.email) {
       return res.status(409).json({
         success: false,
-        message: 'Email already registered',
+        message: 'You already have an account with this email. Please sign in instead.',
       });
     }
 
