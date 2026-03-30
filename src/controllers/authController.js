@@ -3,7 +3,13 @@
  */
 
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const { OAuth2Client } = require('google-auth-library');
 const User = require('../models/User');
+
+const googleClient = new OAuth2Client(process.env.GOOGLE_WEB_CLIENT_ID);
+
+const normalizeEmail = (email = '') => email.trim().toLowerCase();
 
 /**
  * Generate JWT Token
@@ -14,6 +20,15 @@ const generateToken = (id) => {
   });
 };
 
+const formatUser = (user) => ({
+  id: user._id,
+  name: user.name,
+  email: user.email,
+  role: user.role,
+  createdAt: user.createdAt,
+  updatedAt: user.updatedAt,
+});
+
 /**
  * @desc    Register new user
  * @route   POST /api/auth/register
@@ -22,9 +37,10 @@ const generateToken = (id) => {
 exports.register = async (req, res) => {
   try {
     const { name, email, password } = req.body;
+    const normalizedEmail = normalizeEmail(email);
 
     // Validation
-    if (!name || !email || !password) {
+    if (!name || !normalizedEmail || !password) {
       return res.status(400).json({
         success: false,
         message: 'Please provide name, email and password',
@@ -32,18 +48,26 @@ exports.register = async (req, res) => {
     }
 
     // Check if user already exists
-    const existingUser = await User.findOne({ email: email.toLowerCase() });
+    const existingUser = await User.findOne({ email: normalizedEmail });
     if (existingUser) {
-      return res.status(400).json({
+      return res.status(409).json({
         success: false,
         message: 'Email already registered',
+      });
+    }
+
+    // Validate password strength
+    if (password.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password must be at least 6 characters',
       });
     }
 
     // Create user
     const user = await User.create({
       name,
-      email: email.toLowerCase(),
+      email: normalizedEmail,
       password,
     });
 
@@ -55,18 +79,19 @@ exports.register = async (req, res) => {
       message: 'Registration successful',
       data: {
         token,
-        user: {
-          id: user._id,
-          name: user.name,
-          email: user.email,
-          role: user.role,
-          createdAt: user.createdAt,
-          updatedAt: user.updatedAt,
-        },
+        user: formatUser(user),
       },
     });
   } catch (error) {
     console.error('Register error:', error);
+
+    if (error?.code === 11000 && error?.keyPattern?.email) {
+      return res.status(409).json({
+        success: false,
+        message: 'Email already registered',
+      });
+    }
+
     res.status(500).json({
       success: false,
       message: error.message || 'Registration failed',
@@ -82,9 +107,10 @@ exports.register = async (req, res) => {
 exports.login = async (req, res) => {
   try {
     const { email, password } = req.body;
+    const normalizedEmail = normalizeEmail(email);
 
     // Validation
-    if (!email || !password) {
+    if (!normalizedEmail || !password) {
       return res.status(400).json({
         success: false,
         message: 'Please provide email and password',
@@ -92,7 +118,7 @@ exports.login = async (req, res) => {
     }
 
     // Find user and include password
-    const user = await User.findOne({ email: email.toLowerCase() }).select(
+    const user = await User.findOne({ email: normalizedEmail }).select(
       '+password'
     );
 
@@ -128,14 +154,7 @@ exports.login = async (req, res) => {
       message: 'Login successful',
       data: {
         token,
-        user: {
-          id: user._id,
-          name: user.name,
-          email: user.email,
-          role: user.role,
-          createdAt: user.createdAt,
-          updatedAt: user.updatedAt,
-        },
+        user: formatUser(user),
       },
     });
   } catch (error) {
@@ -143,6 +162,114 @@ exports.login = async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Login failed',
+    });
+  }
+};
+
+/**
+ * @desc    Login or register user with Google
+ * @route   POST /api/auth/google
+ * @access  Public
+ */
+exports.googleLogin = async (req, res) => {
+  try {
+    const { idToken } = req.body;
+
+    if (!idToken) {
+      return res.status(400).json({
+        success: false,
+        message: 'Google ID token is required',
+      });
+    }
+
+    if (!process.env.GOOGLE_WEB_CLIENT_ID) {
+      return res.status(500).json({
+        success: false,
+        message: 'Google login is not configured on server',
+      });
+    }
+
+    const ticket = await googleClient.verifyIdToken({
+      idToken,
+      audience: process.env.GOOGLE_WEB_CLIENT_ID,
+    });
+
+    const payload = ticket.getPayload();
+    if (!payload || !payload.email || !payload.sub) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid Google token payload',
+      });
+    }
+
+    if (payload.email_verified === false) {
+      return res.status(401).json({
+        success: false,
+        message: 'Google account email is not verified',
+      });
+    }
+
+    const email = normalizeEmail(payload.email);
+    let user = await User.findOne({ email });
+
+    if (user) {
+      if (!user.isActive) {
+        return res.status(401).json({
+          success: false,
+          message: 'Account has been deactivated',
+        });
+      }
+
+      const updates = {};
+      if (user.authProvider !== 'google') {
+        updates.authProvider = 'google';
+      }
+      if (user.googleId !== payload.sub) {
+        updates.googleId = payload.sub;
+      }
+      if (payload.name && payload.name !== user.name) {
+        updates.name = payload.name;
+      }
+
+      if (Object.keys(updates).length > 0) {
+        user = await User.findByIdAndUpdate(user._id, updates, {
+          new: true,
+          runValidators: true,
+        });
+      }
+    } else {
+      user = await User.create({
+        name: payload.name || email.split('@')[0],
+        email,
+        authProvider: 'google',
+        googleId: payload.sub,
+        password: crypto.randomBytes(32).toString('hex'),
+      });
+    }
+
+    const token = generateToken(user._id);
+
+    res.status(200).json({
+      success: true,
+      message: 'Google login successful',
+      data: {
+        token,
+        user: formatUser(user),
+      },
+    });
+  } catch (error) {
+    console.error('Google login error:', error);
+
+    if (error?.code === 11000 && error?.keyPattern?.email) {
+      return res.status(409).json({
+        success: false,
+        message: 'Email already registered',
+      });
+    }
+
+    res.status(401).json({
+      success: false,
+      message: 'Google authentication failed',
     });
   }
 };
@@ -159,14 +286,7 @@ exports.getMe = async (req, res) => {
     res.status(200).json({
       success: true,
       data: {
-        user: {
-          id: user._id,
-          name: user.name,
-          email: user.email,
-          role: user.role,
-          createdAt: user.createdAt,
-          updatedAt: user.updatedAt,
-        },
+        user: formatUser(user),
       },
     });
   } catch (error) {
@@ -186,19 +306,20 @@ exports.getMe = async (req, res) => {
 exports.updateProfile = async (req, res) => {
   try {
     const { name, email } = req.body;
+    const normalizedEmail = email ? normalizeEmail(email) : null;
 
     const fieldsToUpdate = {};
     if (name) fieldsToUpdate.name = name;
-    if (email) fieldsToUpdate.email = email.toLowerCase();
+    if (normalizedEmail) fieldsToUpdate.email = normalizedEmail;
 
     // Check if email is already taken
-    if (email) {
+    if (normalizedEmail) {
       const existingUser = await User.findOne({
-        email: email.toLowerCase(),
+        email: normalizedEmail,
         _id: { $ne: req.user.id },
       });
       if (existingUser) {
-        return res.status(400).json({
+        return res.status(409).json({
           success: false,
           message: 'Email already in use',
         });
@@ -214,21 +335,80 @@ exports.updateProfile = async (req, res) => {
       success: true,
       message: 'Profile updated successfully',
       data: {
-        user: {
-          id: user._id,
-          name: user.name,
-          email: user.email,
-          role: user.role,
-          createdAt: user.createdAt,
-          updatedAt: user.updatedAt,
-        },
+        user: formatUser(user),
       },
     });
   } catch (error) {
     console.error('Update profile error:', error);
+
+    if (error?.code === 11000 && error?.keyPattern?.email) {
+      return res.status(409).json({
+        success: false,
+        message: 'Email already in use',
+      });
+    }
+
     res.status(500).json({
       success: false,
       message: 'Failed to update profile',
+    });
+  }
+};
+
+/**
+ * @desc    Forgot password (reset by email)
+ * @route   POST /api/auth/forgot-password
+ * @access  Public
+ */
+exports.forgotPassword = async (req, res) => {
+  try {
+    const { email, newPassword } = req.body;
+    const normalizedEmail = normalizeEmail(email);
+
+    if (!normalizedEmail || !newPassword) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide email and new password',
+      });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password must be at least 6 characters',
+      });
+    }
+
+    const user = await User.findOne({ email: normalizedEmail }).select('+password');
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'No account found for this email',
+      });
+    }
+
+    if (!user.isActive) {
+      return res.status(401).json({
+        success: false,
+        message: 'Account has been deactivated',
+      });
+    }
+
+    user.password = newPassword;
+    user.passwordResetToken = null;
+    user.passwordResetExpires = null;
+    await user.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Password reset successful. Please login with your new password.',
+    });
+  } catch (error) {
+    console.error('Forgot password error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to reset password',
     });
   }
 };

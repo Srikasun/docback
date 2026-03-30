@@ -29,11 +29,11 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 // Security middleware
 app.use(helmet());
 
-// CORS configuration - allow all origins for simple conversions
+// CORS configuration - allow all origins for API access with necessary methods
 app.use(cors({
   origin: '*',
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
 // Body parsing middleware with larger limits for file uploads
